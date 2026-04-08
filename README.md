@@ -18,6 +18,10 @@ Mở trình duyệt tại địa chỉ hiển thị trong terminal, mặc địn
 
 ## Chạy bằng Docker
 
+Dockerfile đã hỗ trợ cả 2 trường hợp:
+- Có `uv.lock` -> dùng lock file (`uv sync --frozen --no-dev`)
+- Chưa có `uv.lock` -> vẫn build được (`uv sync --no-dev`)
+
 Build image:
 
 ```bash

@@ -14,10 +14,13 @@ RUN apt-get update \
 
 RUN pip install --no-cache-dir uv
 
-COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev
-
 COPY . .
+
+RUN if [ -f uv.lock ]; then \
+        uv sync --frozen --no-dev; \
+    else \
+        uv sync --no-dev; \
+    fi
 
 EXPOSE 7860
 
