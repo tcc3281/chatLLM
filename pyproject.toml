@@ -1,0 +1,13 @@
+[project]
+name = "chatllm"
+version = "0.1.0"
+description = "Gradio chat UI for testing OpenAI-compatible multimodal models"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+	"gradio>=5.0.0",
+	"openai>=1.40.0",
+]
+
+[project.scripts]
+chatllm = "main:main"

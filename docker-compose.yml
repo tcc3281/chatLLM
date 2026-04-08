@@ -1,0 +1,15 @@
+services:
+  chatllm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: chatllm:latest
+    container_name: chatllm
+    ports:
+      - "7860:7860"
+    env_file:
+      - .env
+    environment:
+      - HOST=0.0.0.0
+      - PORT=7860
+    restart: unless-stopped
