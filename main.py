@@ -98,6 +98,35 @@ def _normalize_message(value: Any) -> tuple[str, list[str]]:
     return str(value or "").strip(), []
 
 
+def _split_multimodal_files(file_paths: list[str]) -> tuple[list[str], list[str]]:
+    image_paths: list[str] = []
+    text_chunks: list[str] = []
+
+    for file_path in file_paths:
+        path = Path(file_path)
+        if not path.exists():
+            raise gr.Error(f"Không tìm thấy file: {file_path}")
+
+        mime_type, _ = mimetypes.guess_type(file_path)
+        mime_type = (mime_type or "").lower()
+
+        if mime_type.startswith("image/"):
+            image_paths.append(file_path)
+            continue
+
+        if mime_type.startswith("text/"):
+            text_content = path.read_text(encoding="utf-8", errors="ignore").strip()
+            if text_content:
+                text_chunks.append(text_content)
+            continue
+
+        raise gr.Error(
+            f"File không hỗ trợ: {path.name}. Chỉ nhận ảnh hoặc text."
+        )
+
+    return image_paths, text_chunks
+
+
 def _file_to_data_url(file_path: str) -> str:
     mime_type, _ = mimetypes.guess_type(file_path)
     mime_type = mime_type or "application/octet-stream"
@@ -287,22 +316,22 @@ def chat(
     max_tokens: int,
     system_prompt: str,
 ):
-    text, image_paths = _normalize_message(message)
-    if not text and not image_paths:
-        raise gr.Error("Nhập nội dung hoặc tải ảnh lên trước khi gửi.")
+    text, file_paths = _normalize_message(message)
+    image_paths, text_chunks = _split_multimodal_files(file_paths)
 
-    for image_path in image_paths:
-        if not Path(image_path).exists():
-            raise gr.Error(f"Không tìm thấy file ảnh: {image_path}")
+    merged_text = "\n\n".join(part for part in [text, *text_chunks] if part).strip()
+
+    if not merged_text and not image_paths:
+        raise gr.Error("Nhập nội dung hoặc tải ảnh lên trước khi gửi.")
 
     model = _resolve_model(model_name)
     client = _make_client(base_url, api_key)
 
-    display_content = _build_display_content(text, image_paths)
+    display_content = _build_display_content(merged_text, image_paths)
 
     ui_history = ui_history + [{"role": "user", "content": display_content}, {"role": "assistant", "content": ""}]
 
-    user_content = _api_message_content(text, image_paths)
+    user_content = _api_message_content(merged_text, image_paths)
     request_messages = [
         {"role": "system", "content": system_prompt.strip() or DEFAULT_SYSTEM_PROMPT},
         *api_history,
@@ -351,9 +380,9 @@ def build_demo() -> gr.Blocks:
                 chatbot = gr.Chatbot(height=650, label="Chat")
                 message = gr.MultimodalTextbox(
                     label="Nội dung",
-                    placeholder="Nhập câu hỏi, rồi upload hoặc paste nhiều ảnh vào đây...",
+                    placeholder="Nhập/paste text dài hoặc paste/upload ảnh vào đây...",
                     file_count="multiple",
-                    file_types=["image"],
+                    file_types=None,
                 )
                 with gr.Row():
                     send_btn = gr.Button("Gửi", variant="primary")
