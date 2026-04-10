@@ -98,6 +98,39 @@ def _normalize_message(value: Any) -> tuple[str, list[str]]:
     return str(value or "").strip(), []
 
 
+def _merge_text_with_text_files(text: str, file_paths: list[str]) -> tuple[str, list[str]]:
+    merged_text = text.strip()
+    image_paths: list[str] = []
+
+    text_suffixes = {".txt", ".md", ".json", ".csv", ".log", ".yaml", ".yml"}
+
+    for file_path in file_paths:
+        path = Path(file_path)
+        if not path.exists():
+            continue
+
+        mime_type, _ = mimetypes.guess_type(file_path)
+        mime_type = (mime_type or "").lower()
+
+        if mime_type.startswith("image/"):
+            image_paths.append(file_path)
+            continue
+
+        is_text_like = mime_type.startswith("text/") or path.suffix.lower() in text_suffixes
+        if not is_text_like:
+            continue
+
+        try:
+            file_text = path.read_text(encoding="utf-8", errors="ignore").strip()
+        except Exception:  # noqa: BLE001
+            continue
+
+        if file_text:
+            merged_text = f"{merged_text}\n{file_text}".strip() if merged_text else file_text
+
+    return merged_text, image_paths
+
+
 def _file_to_data_url(file_path: str) -> str:
     mime_type, _ = mimetypes.guess_type(file_path)
     mime_type = mime_type or "application/octet-stream"
@@ -287,7 +320,8 @@ def chat(
     max_tokens: int,
     system_prompt: str,
 ):
-    text, image_paths = _normalize_message(message)
+    text, file_paths = _normalize_message(message)
+    text, image_paths = _merge_text_with_text_files(text, file_paths)
     if not text and not image_paths:
         raise gr.Error("Nhập nội dung hoặc tải ảnh lên trước khi gửi.")
 
@@ -353,7 +387,7 @@ def build_demo() -> gr.Blocks:
                     label="Nội dung",
                     placeholder="Nhập câu hỏi, rồi upload hoặc paste nhiều ảnh vào đây...",
                     file_count="multiple",
-                    file_types=["image"],
+                    file_types=None,
                 )
                 with gr.Row():
                     send_btn = gr.Button("Gửi", variant="primary")
