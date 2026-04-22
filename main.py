@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import mimetypes
 import os
 from pathlib import Path
@@ -58,6 +59,12 @@ def _env_any(names: list[str], default: str) -> str:
     return default
 
 
+def _decoded_image_dir() -> Path:
+    decoded_dir = Path("./data/decoded_images").expanduser()
+    decoded_dir.mkdir(parents=True, exist_ok=True)
+    return decoded_dir
+
+
 def _normalize_files(value: Any) -> list[str]:
     if value is None:
         return []
@@ -92,20 +99,23 @@ def _normalize_message(value: Any) -> tuple[str, list[str]]:
 
     if isinstance(value, tuple) and len(value) == 2:
         text = str(value[0] or "").strip()
+        files = _normalize_message(value[1])[0] # This looks wrong in original, let's fix
         files = _normalize_files(value[1])
         return text, files
 
     return str(value or "").strip(), []
 
 
-def _split_multimodal_files(file_paths: list[str]) -> tuple[list[str], list[str]]:
+def _merge_text_with_text_files(text: str, file_paths: list[str]) -> tuple[str, list[str]]:
+    merged_text = text.strip()
     image_paths: list[str] = []
-    text_chunks: list[str] = []
+
+    text_suffixes = {".txt", ".md", ".json", ".csv", ".log", ".yaml", ".yml"}
 
     for file_path in file_paths:
         path = Path(file_path)
         if not path.exists():
-            raise gr.Error(f"Không tìm thấy file: {file_path}")
+            continue
 
         mime_type, _ = mimetypes.guess_type(file_path)
         mime_type = (mime_type or "").lower()
@@ -114,17 +124,19 @@ def _split_multimodal_files(file_paths: list[str]) -> tuple[list[str], list[str]
             image_paths.append(file_path)
             continue
 
-        if mime_type.startswith("text/"):
-            text_content = path.read_text(encoding="utf-8", errors="ignore").strip()
-            if text_content:
-                text_chunks.append(text_content)
+        is_text_like = mime_type.startswith("text/") or path.suffix.lower() in text_suffixes
+        if not is_text_like:
             continue
 
-        raise gr.Error(
-            f"File không hỗ trợ: {path.name}. Chỉ nhận ảnh hoặc text."
-        )
+        try:
+            file_text = path.read_text(encoding="utf-8", errors="ignore").strip()
+        except Exception:  # noqa: BLE001
+            continue
 
-    return image_paths, text_chunks
+        if file_text:
+            merged_text = f"{merged_text}\n{file_text}".strip() if merged_text else file_text
+
+    return merged_text, image_paths
 
 
 def _file_to_data_url(file_path: str) -> str:
@@ -133,6 +145,52 @@ def _file_to_data_url(file_path: str) -> str:
     raw = Path(file_path).read_bytes()
     encoded = base64.b64encode(raw).decode("utf-8")
     return f"data:{mime_type};base64,{encoded}"
+
+
+def encode_image_to_base64(image_file: Any) -> tuple[str, str]:
+    files = _normalize_files(image_file)
+    if not files:
+        raise gr.Error("Vui lòng chọn ảnh trước khi encode.")
+
+    image_path = files[0]
+    path = Path(image_path)
+    if not path.exists():
+        raise gr.Error(f"Không tìm thấy file ảnh: {image_path}")
+
+    mime_type, _ = mimetypes.guess_type(image_path)
+    mime_type = mime_type or "application/octet-stream"
+    if not mime_type.startswith("image/"):
+        raise gr.Error("File đã chọn không phải ảnh.")
+
+    encoded = base64.b64encode(path.read_bytes()).decode("utf-8")
+    data_url = f"data:{mime_type};base64,{encoded}"
+    return encoded, data_url
+
+
+def decode_base64_to_image(base64_value: str) -> tuple[str | None, str | None, str]:
+    payload = (base64_value or "").strip()
+    if not payload:
+        raise gr.Error("Vui lòng nhập chuỗi base64 trước khi decode.")
+
+    mime_type = "image/png"
+    if payload.startswith("data:") and "," in payload:
+        header, payload = payload.split(",", 1)
+        if ";" in header:
+            mime_type = header[5:].split(";", 1)[0] or "image/png"
+
+    clean_payload = "".join(payload.split())
+    try:
+        raw = base64.b64decode(clean_payload, validate=True)
+    except Exception as exc:  # noqa: BLE001
+        raise gr.Error(f"Base64 không hợp lệ: {exc}") from exc
+
+    if not mime_type.startswith("image/"):
+        mime_type = "image/png"
+
+    ext = mimetypes.guess_extension(mime_type) or ".png"
+    output_path = _decoded_image_dir() / f"decoded_{uuid4().hex}{ext}"
+    output_path.write_bytes(raw)
+    return str(output_path), str(output_path), f"Đã decode ảnh thành công: {output_path.name}"
 
 
 def _build_user_content(text: str, image_paths: list[str]) -> list[dict[str, Any]]:
@@ -294,13 +352,7 @@ def _build_display_content(text: str, image_paths: list[str]) -> str | list[Any]
         content.append(text)
 
     for image_path in image_paths:
-        content.append(
-            gr.Image(
-                value=image_path,
-                show_label=False,
-                interactive=False,
-            )
-        )
+        content.append({"path": image_path})
 
     return content
 
@@ -317,21 +369,25 @@ def chat(
     system_prompt: str,
 ):
     text, file_paths = _normalize_message(message)
-    image_paths, text_chunks = _split_multimodal_files(file_paths)
-
-    merged_text = "\n\n".join(part for part in [text, *text_chunks] if part).strip()
-
-    if not merged_text and not image_paths:
+    text, image_paths = _merge_text_with_text_files(text, file_paths)
+    if not text and not image_paths:
         raise gr.Error("Nhập nội dung hoặc tải ảnh lên trước khi gửi.")
+
+    for image_path in image_paths:
+        if not Path(image_path).exists():
+            raise gr.Error(f"Không tìm thấy file ảnh: {image_path}")
 
     model = _resolve_model(model_name)
     client = _make_client(base_url, api_key)
 
-    display_content = _build_display_content(merged_text, image_paths)
+    display_content = _build_display_content(text, image_paths)
 
-    ui_history = ui_history + [{"role": "user", "content": display_content}, {"role": "assistant", "content": ""}]
+    ui_history = list(ui_history) + [
+        {"role": "user", "content": display_content},
+        {"role": "assistant", "content": ""}
+    ]
 
-    user_content = _api_message_content(merged_text, image_paths)
+    user_content = _api_message_content(text, image_paths)
     request_messages = [
         {"role": "system", "content": system_prompt.strip() or DEFAULT_SYSTEM_PROMPT},
         *api_history,
@@ -356,8 +412,7 @@ def chat(
 
     assistant_text = assistant_text.strip() or "(không có nội dung trả về)"
     ui_history[-1]["content"] = assistant_text
-    api_history = [
-        *api_history,
+    api_history = list(api_history) + [
         {"role": "user", "content": user_content},
         {"role": "assistant", "content": assistant_text},
     ]
@@ -369,76 +424,127 @@ def clear_chat():
 
 
 def build_demo() -> gr.Blocks:
-    with gr.Blocks(title="ChatLLM Tester") as demo:
+    with gr.Blocks(
+        title="ChatLLM Tester",
+    ) as demo:
         gr.Markdown(
             "# ChatLLM Tester\n"
             "Giao diện chat để test model OpenAI-compatible, hỗ trợ nhiều ảnh upload hoặc paste."
         )
 
-        with gr.Row():
-            with gr.Column(scale=3):
-                chatbot = gr.Chatbot(height=650, label="Chat")
-                message = gr.MultimodalTextbox(
-                    label="Nội dung",
-                    placeholder="Nhập/paste text dài hoặc paste/upload ảnh vào đây...",
-                    file_count="multiple",
-                    file_types=None,
-                )
+        with gr.Tabs():
+            with gr.Tab("Chat"):
                 with gr.Row():
-                    send_btn = gr.Button("Gửi", variant="primary")
-                    clear_btn = gr.Button("Xoá chat")
+                    with gr.Column(scale=3):
+                        chatbot = gr.Chatbot(height=650, label="Chat")
+                        message = gr.MultimodalTextbox(
+                            label="Nội dung",
+                            placeholder="Nhập câu hỏi, rồi upload hoặc paste nhiều ảnh vào đây...",
+                            file_count="multiple",
+                            file_types=None,
+                        )
+                        with gr.Row():
+                            send_btn = gr.Button("Gửi", variant="primary")
+                            clear_btn = gr.Button("Xoá chat")
 
-            with gr.Column(scale=2):
-                gr.Markdown("## Cấu hình")
-                model_source = gr.Radio(
-                    choices=["Model có sẵn", "Custom"],
-                    value="Model có sẵn",
-                    label="Nguồn cấu hình",
-                )
-                model_name = gr.Dropdown(
-                    choices=[DEFAULT_MODEL],
-                    value=DEFAULT_MODEL,
-                    label="Model",
-                    allow_custom_value=True,
-                    interactive=False,
-                )
-                base_url = gr.Textbox(
-                    label="Base URL",
-                    value=_env_any(["OPENAI_BASE_URL", "base_url"], "https://api.openai.com/v1"),
-                    placeholder="https://api.openai.com/v1",
-                    interactive=False,
-                )
-                api_key = gr.Textbox(
-                    label="API key",
-                    value=_env_any(["OPENAI_API_KEY", "api_key"], ""),
-                    placeholder="Nhập API key",
-                    type="password",
-                    interactive=False,
-                )
+                    with gr.Column(scale=2):
+                        gr.Markdown("## Cấu hình")
+                        model_source = gr.Radio(
+                            choices=["Model có sẵn", "Custom"],
+                            value="Model có sẵn",
+                            label="Nguồn cấu hình",
+                        )
+                        model_name = gr.Dropdown(
+                            choices=[DEFAULT_MODEL],
+                            value=DEFAULT_MODEL,
+                            label="Model",
+                            allow_custom_value=True,
+                            interactive=False,
+                        )
+                        base_url = gr.Textbox(
+                            label="Base URL",
+                            value=_env_any(["OPENAI_BASE_URL", "base_url"], "https://api.openai.com/v1"),
+                            placeholder="https://api.openai.com/v1",
+                            interactive=False,
+                        )
+                        api_key = gr.Textbox(
+                            label="API key",
+                            value=_env_any(["OPENAI_API_KEY", "api_key"], ""),
+                            placeholder="Nhập API key",
+                            type="password",
+                            interactive=False,
+                        )
+                        with gr.Row():
+                            refresh_models_btn = gr.Button("Tải model", variant="secondary")
+                        model_status = gr.Markdown(value="")
+                        temperature = gr.Slider(
+                            minimum=0,
+                            maximum=2,
+                            value=0.2,
+                            step=0.1,
+                            label="Temperature",
+                        )
+                        max_tokens = gr.Slider(
+                            minimum=16,
+                            maximum=8192,
+                            value=1024,
+                            step=16,
+                            label="Max tokens",
+                        )
+                        system_prompt = gr.Textbox(
+                            label="System prompt",
+                            value=DEFAULT_SYSTEM_PROMPT,
+                            lines=8,
+                        )
+                        gr.Markdown(
+                            "**Gợi ý:** đổi Base URL và API key, sau đó tải model từ `/v1/models`."
+                        )
+
+            with gr.Tab("Base64 Ảnh"):
+                gr.Markdown("Encode ảnh sang base64 hoặc decode base64 thành ảnh.")
                 with gr.Row():
-                    refresh_models_btn = gr.Button("Tải model", variant="secondary")
-                model_status = gr.Markdown(value="")
-                temperature = gr.Slider(
-                    minimum=0,
-                    maximum=2,
-                    value=0.2,
-                    step=0.1,
-                    label="Temperature",
+                    with gr.Column(scale=1):
+                        encode_image_input = gr.Image(type="filepath", label="Ảnh cần encode")
+                        encode_btn = gr.Button("Encode ảnh", variant="primary")
+                        encoded_base64_output = gr.Textbox(label="Base64", lines=10)
+                        copy_base64_btn = gr.Button("Copy Base64", variant="secondary")
+                        encoded_data_url_output = gr.Textbox(label="Data URL", lines=10)
+                        copy_data_url_btn = gr.Button("Copy Data URL", variant="secondary")
+
+                    with gr.Column(scale=1):
+                        decode_base64_input = gr.Textbox(label="Base64 hoặc Data URL", lines=10)
+                        decode_btn = gr.Button("Decode base64", variant="primary")
+                        decoded_image_output = gr.Image(type="filepath", label="Ảnh đã decode")
+                        decoded_file_output = gr.File(label="Tải ảnh decode")
+                        decode_status = gr.Markdown(value="")
+
+                encode_btn.click(
+                    encode_image_to_base64,
+                    inputs=[encode_image_input],
+                    outputs=[encoded_base64_output, encoded_data_url_output],
                 )
-                max_tokens = gr.Slider(
-                    minimum=16,
-                    maximum=8192,
-                    value=1024,
-                    step=16,
-                    label="Max tokens",
+                copy_base64_btn.click(
+                    fn=None,
+                    inputs=[encoded_base64_output],
+                    js="""
+                    (value) => {
+                        navigator.clipboard.writeText(value || "");
+                    }
+                    """,
                 )
-                system_prompt = gr.Textbox(
-                    label="System prompt",
-                    value=DEFAULT_SYSTEM_PROMPT,
-                    lines=8,
+                copy_data_url_btn.click(
+                    fn=None,
+                    inputs=[encoded_data_url_output],
+                    js="""
+                    (value) => {
+                        navigator.clipboard.writeText(value || "");
+                    }
+                    """,
                 )
-                gr.Markdown(
-                    "**Gợi ý:** đổi Base URL và API key, sau đó tải model từ `/v1/models`."
+                decode_btn.click(
+                    decode_base64_to_image,
+                    inputs=[decode_base64_input],
+                    outputs=[decoded_image_output, decoded_file_output, decode_status],
                 )
 
         ui_state = gr.State([])
@@ -540,6 +646,10 @@ def main() -> None:
         server_port=int(_env("PORT", "7860")),
         share=bool(int(_env("SHARE", "0"))),
         theme=gr.themes.Soft(),
+        css="""
+        footer {display: none !important;}
+        #api-button {display: none !important;}
+        """,
     )
 
 
