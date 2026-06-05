@@ -1,46 +1,67 @@
 from __future__ import annotations
 
 import base64
+import datetime
 import json
 import mimetypes
+import re
+import threading
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 import gradio as gr
-from markitdown import MarkItDown
 
 from .config import env
 
-_MARKITDOWN_CLIENT: MarkItDown | None = None
+if TYPE_CHECKING:
+    from markitdown import MarkItDown
+
+# ---------------------------------------------------------------------------
+# MarkItDown (thread-safe singleton)
+# ---------------------------------------------------------------------------
+
+_MARKITDOWN_CLIENT: "MarkItDown | None" = None
+_MARKITDOWN_LOCK = threading.Lock()
 
 
-def get_markitdown() -> MarkItDown:
+def get_markitdown() -> "MarkItDown":
     global _MARKITDOWN_CLIENT
     if _MARKITDOWN_CLIENT is None:
-        _MARKITDOWN_CLIENT = MarkItDown()
+        with _MARKITDOWN_LOCK:
+            if _MARKITDOWN_CLIENT is None:
+                from markitdown import MarkItDown
+
+                _MARKITDOWN_CLIENT = MarkItDown()
     return _MARKITDOWN_CLIENT
 
 
+# ---------------------------------------------------------------------------
+# Directories
+# ---------------------------------------------------------------------------
+
 def decoded_image_dir() -> Path:
-    decoded_dir = Path("./data/decoded_images").expanduser()
+    decoded_dir = Path(env("CHAT_HISTORY_DIR", "./data/decoded_images")).expanduser().resolve()
     decoded_dir.mkdir(parents=True, exist_ok=True)
     return decoded_dir
 
 
 def chat_history_dir() -> Path:
-    history_dir = Path(env("CHAT_HISTORY_DIR", "./data/chat_history")).expanduser()
+    history_dir = Path(env("CHAT_HISTORY_DIR", "./data/chat_history")).expanduser().resolve()
     history_dir.mkdir(parents=True, exist_ok=True)
     return history_dir
 
+
+# ---------------------------------------------------------------------------
+# Chat history persistence
+# ---------------------------------------------------------------------------
 
 def save_chat_history(
     session_id: str,
     config: dict[str, Any],
     messages: list[dict[str, Any]],
-):
-    import datetime
-    
+) -> None:
     history_file = chat_history_dir() / f"history_{datetime.date.today()}.jsonl"
     entry = {
         "timestamp": datetime.datetime.now().isoformat(),
@@ -51,6 +72,57 @@ def save_chat_history(
     with history_file.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
+
+# ---------------------------------------------------------------------------
+# File/message normalization
+# ---------------------------------------------------------------------------
+
+_URL_PATTERN = re.compile(r"(https?://[^\s<>'\"]+|data:(?:image|video)/[^\s<>'\"]+)", re.IGNORECASE)
+_TRAILING_URL_PUNCTUATION = ".,;:!?)]}"
+_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
+_VIDEO_SUFFIXES = {".mp4", ".mpeg", ".mpg", ".mov", ".avi", ".webm", ".mkv", ".m4v"}
+
+
+def _split_url_trailing_punctuation(url: str) -> tuple[str, str]:
+    trailing = ""
+    while url and url[-1] in _TRAILING_URL_PUNCTUATION:
+        trailing = url[-1] + trailing
+        url = url[:-1]
+    return url, trailing
+
+
+def _media_type_from_url(url: str) -> str | None:
+    lowered_url = url.lower()
+    if lowered_url.startswith("data:image/"):
+        return "image_url"
+    if lowered_url.startswith("data:video/"):
+        return "video_url"
+
+    suffix = Path(urlparse(url).path).suffix.lower()
+    if suffix in _IMAGE_SUFFIXES:
+        return "image_url"
+    if suffix in _VIDEO_SUFFIXES:
+        return "video_url"
+    return None
+
+
+def extract_media_urls(text: str) -> tuple[str, list[dict[str, str]]]:
+    media_urls: list[dict[str, str]] = []
+
+    def replace_match(match: re.Match[str]) -> str:
+        raw_url = match.group(0)
+        url, trailing = _split_url_trailing_punctuation(raw_url)
+        media_type = _media_type_from_url(url)
+        if not media_type:
+            return raw_url
+
+        media_urls.append({"type": media_type, "url": url})
+        return trailing
+
+    cleaned_text = _URL_PATTERN.sub(replace_match, text).strip()
+    cleaned_text = re.sub(r"[ \t]{2,}", " ", cleaned_text)
+    cleaned_text = re.sub(r"\n{3,}", "\n\n", cleaned_text)
+    return cleaned_text, media_urls
 
 def normalize_files(value: Any) -> list[str]:
     if value is None:
@@ -92,46 +164,52 @@ def normalize_message(value: Any) -> tuple[str, list[str]]:
     return str(value or "").strip(), []
 
 
+# ---------------------------------------------------------------------------
+# YouTube extraction
+# ---------------------------------------------------------------------------
+
 def get_youtube_info(url: str) -> str:
     import yt_dlp
-    
-    ydl_opts = {
+
+    ydl_opts: dict[str, Any] = {
         "skip_download": True,
         "quiet": True,
         "no_warnings": True,
         "extract_flat": False,
     }
-    
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            
+
             title = info.get("title", "Unknown Title")
             description = info.get("description", "")
             channel = info.get("uploader", "Unknown Channel")
             duration = info.get("duration_string", "")
-            
+
             output = f"# {title}\n"
             output += f"**Channel:** {channel} | **Duration:** {duration}\n\n"
             output += "## Description\n"
             output += description if description else "(No description available)"
-            
+
             return output.strip()
     except Exception as exc:
         return f"Error extracting YouTube info: {exc}"
 
+
+# ---------------------------------------------------------------------------
+# File merging (text / MarkItDown / images)
+# ---------------------------------------------------------------------------
 
 def merge_text_with_text_files(text: str, file_paths: list[str]) -> tuple[str, list[str], list[str]]:
     merged_text = text.strip()
     image_paths: list[str] = []
     other_file_paths: list[str] = []
 
-    # Standard text-like suffixes
     text_suffixes = {".txt", ".md", ".json", ".csv", ".log", ".yaml", ".yml"}
-    # Suffixes supported by MarkItDown [all]
     markitdown_suffixes = {
         ".pdf", ".docx", ".pptx", ".xlsx", ".xls", ".html", ".htm", ".zip",
-        ".msg", ".eml", ".mp3", ".wav"
+        ".msg", ".eml", ".mp3", ".wav",
     }
 
     for file_path in file_paths:
@@ -139,7 +217,6 @@ def merge_text_with_text_files(text: str, file_paths: list[str]) -> tuple[str, l
         if not path.exists():
             continue
 
-        # Handle YouTube URLs passed as "files"
         if str(file_path).startswith(("https://www.youtube.com", "https://youtu.be")):
             try:
                 print(f"[chatLLM] Transcribing YouTube with yt-dlp: {file_path}...")
@@ -155,14 +232,12 @@ def merge_text_with_text_files(text: str, file_paths: list[str]) -> tuple[str, l
         mime_type, _ = mimetypes.guess_type(file_path)
         mime_type = (mime_type or "").lower()
 
-        # Handle Images
         if mime_type.startswith("image/"):
             image_paths.append(file_path)
             continue
 
         other_file_paths.append(file_path)
 
-        # Handle plain text files
         is_text_like = mime_type.startswith("text/") or path.suffix.lower() in text_suffixes
         if is_text_like:
             try:
@@ -171,11 +246,9 @@ def merge_text_with_text_files(text: str, file_paths: list[str]) -> tuple[str, l
                     merged_text = f"{merged_text}\n\n--- File: {path.name} ---\n{file_text}".strip() if merged_text else file_text
                     print(f"[chatLLM] Loaded text file: {path.name}")
                 continue
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 print(f"[chatLLM] Error reading text file {path.name}: {exc}")
-                pass
 
-        # Handle everything else with MarkItDown (PDF, Word, Excel, etc.)
         if path.suffix.lower() in markitdown_suffixes:
             try:
                 print(f"[chatLLM] Converting with MarkItDown: {path.name}...")
@@ -188,12 +261,15 @@ def merge_text_with_text_files(text: str, file_paths: list[str]) -> tuple[str, l
                     else:
                         print(f"[chatLLM] MarkItDown returned empty content for {path.name}")
                 continue
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 print(f"[chatLLM] MarkItDown conversion error for {path.name}: {exc}")
-                continue
 
     return merged_text, image_paths, other_file_paths
 
+
+# ---------------------------------------------------------------------------
+# Data URL helpers
+# ---------------------------------------------------------------------------
 
 def file_to_data_url(file_path: str) -> str:
     mime_type, _ = mimetypes.guess_type(file_path)
@@ -202,6 +278,10 @@ def file_to_data_url(file_path: str) -> str:
     encoded = base64.b64encode(raw).decode("utf-8")
     return f"data:{mime_type};base64,{encoded}"
 
+
+# ---------------------------------------------------------------------------
+# Base64 encode / decode images
+# ---------------------------------------------------------------------------
 
 def encode_image_to_base64(image_file: Any) -> tuple[str, str]:
     files = normalize_files(image_file)
@@ -237,7 +317,7 @@ def decode_base64_to_image(base64_value: str) -> tuple[str | None, str | None, s
     clean_payload = "".join(payload.split())
     try:
         raw = base64.b64decode(clean_payload, validate=True)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise gr.Error(f"Base64 không hợp lệ: {exc}") from exc
 
     if not mime_type.startswith("image/"):

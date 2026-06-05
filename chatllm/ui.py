@@ -1,115 +1,43 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any
 
 import gradio as gr
 
-from .config import DEFAULT_MODEL, DEFAULT_SYSTEM_PROMPT, env, env_any
-from .llm import (
-    chat,
+from .chat import chat
+from .config import DEFAULT_SYSTEM_PROMPT, env_any
+from .handlers import (
+    clear_chat,
+    convert_to_markdown,
     load_builtin_locked_model,
-    list_models,
+    refresh_models_for_custom,
     remember_custom_inputs,
+    switch_model_source,
 )
-from .utils import (
-    encode_image_to_base64,
-    decode_base64_to_image,
-)
+from .utils import decode_base64_to_image, encode_image_to_base64
 
-
-def clear_chat():
-    def _clear_input() -> dict[str, Any]:
-        return {"text": "", "files": []}
-    return [], [], [], _clear_input(), "**Token Usage:** _Chưa có dữ liệu_"
-
-
-def switch_model_source(
-    model_source: str,
-    custom_base_url: str,
-    custom_api_key: str,
-    custom_model: str,
-):
-    if model_source == "Custom":
-        base = (custom_base_url or env_any(["OPENAI_BASE_URL", "base_url"], "https://api.openai.com/v1")).strip()
-        key = (custom_api_key or env_any(["OPENAI_API_KEY", "api_key"], "")).strip()
-        model = (custom_model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
-        return (
-            gr.update(value=base, interactive=True),
-            gr.update(value=key, interactive=True),
-            gr.update(choices=[model], value=model, interactive=True),
-            "Đã chuyển sang Custom. Giữ thông tin bạn đã nhập.",
-        )
-
-    builtin_base = env_any(["OPENAI_BASE_URL", "base_url"], "https://api.openai.com/v1")
-    builtin_key = env_any(["OPENAI_API_KEY", "api_key"], "")
-    model_update, status = load_builtin_locked_model(builtin_base, builtin_key)
-    return (
-        gr.update(value=builtin_base, interactive=False),
-        gr.update(value=builtin_key, interactive=False),
-        model_update,
-        status,
-    )
-
-
-def refresh_models_for_custom(
-    model_source: str,
-    base_url: str,
-    api_key: str,
-    current_model: str,
-    custom_base_url: str,
-    custom_api_key: str,
-    custom_model: str,
-):
-    if model_source != "Custom":
-        model_update, status = load_builtin_locked_model(base_url, api_key)
-        return (
-            model_update,
-            status,
-            custom_base_url,
-            custom_api_key,
-            custom_model,
-        )
-
-    try:
-        models = list_models(base_url, api_key)
-        preferred = (current_model or custom_model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
-        selected = preferred if preferred in models else models[0]
-        return (
-            gr.update(choices=models, value=selected, interactive=True),
-            f"Đã tải {len(models)} model.",
-            base_url,
-            api_key,
-            selected,
-        )
-    except Exception as exc:  # noqa: BLE001
-        fallback = (current_model or custom_model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
-        return (
-            gr.update(choices=[fallback], value=fallback, interactive=True),
-            f"Không tải được model: {exc}",
-            base_url,
-            api_key,
-            fallback,
-        )
+_COPY_JS = """
+(value) => {
+    navigator.clipboard.writeText(value || "");
+}
+"""
 
 
 def build_demo() -> gr.Blocks:
-    with gr.Blocks(
-        title="ChatLLM Tester",
-    ) as demo:
+    with gr.Blocks(title="ChatLLM Tester") as demo:
         gr.Markdown(
             "# ChatLLM Tester\n"
             "Giao diện chat để test model OpenAI-compatible, hỗ trợ nhiều ảnh upload hoặc paste."
         )
 
         with gr.Tabs():
-            with gr.Tab("Chat"):
+            with gr.Tab("Chat", render_children=True):
                 with gr.Row():
                     with gr.Column(scale=3):
                         chatbot = gr.Chatbot(height=650, label="Chat")
                         message = gr.MultimodalTextbox(
                             label="Nội dung",
-                            placeholder="Nhập câu hỏi, YouTube URL, rồi upload hoặc paste ảnh/file/audio...",
+                            placeholder="Nhập câu hỏi, URL ảnh/video, YouTube URL, rồi upload hoặc paste ảnh/file/audio...",
                             file_count="multiple",
                             file_types=["image", "audio", ".pdf", ".docx", ".pptx", ".xlsx", ".xls", ".txt", ".csv", ".json", ".md", ".msg", ".eml"],
                         )
@@ -125,8 +53,8 @@ def build_demo() -> gr.Blocks:
                             label="Nguồn cấu hình",
                         )
                         model_name = gr.Dropdown(
-                            choices=[DEFAULT_MODEL],
-                            value=DEFAULT_MODEL,
+                            choices=[],
+                            value=None,
                             label="Model",
                             allow_custom_value=True,
                             interactive=False,
@@ -147,39 +75,25 @@ def build_demo() -> gr.Blocks:
                         with gr.Row():
                             refresh_models_btn = gr.Button("Tải model", variant="secondary")
                             enable_thinking = gr.Checkbox(label="Enable Thinking", value=False)
-                        model_status = gr.Markdown(value="")
+                        model_status = gr.Markdown(
+                            value="Model có sẵn: đang tải danh sách model từ `/v1/models`..."
+                        )
                         usage_status = gr.Markdown(value="**Token Usage:** _Chưa có dữ liệu_")
                         temperature = gr.Slider(
-                            minimum=0,
-                            maximum=2,
-                            value=0.2,
-                            step=0.1,
-                            label="Temperature",
+                            minimum=0, maximum=2, value=0.2, step=0.1, label="Temperature",
                         )
                         top_p = gr.Slider(
-                            minimum=0,
-                            maximum=1,
-                            value=0.9,
-                            step=0.05,
-                            label="Top-P",
+                            minimum=0, maximum=1, value=0.9, step=0.05, label="Top-P",
                         )
                         max_tokens = gr.Slider(
-                            minimum=16,
-                            maximum=8192,
-                            value=1024,
-                            step=16,
-                            label="Max tokens",
+                            minimum=16, maximum=8192, value=1024, step=16, label="Max tokens",
                         )
                         system_prompt = gr.Textbox(
-                            label="System prompt",
-                            value=DEFAULT_SYSTEM_PROMPT,
-                            lines=8,
+                            label="System prompt", value=DEFAULT_SYSTEM_PROMPT, lines=8,
                         )
-                        gr.Markdown(
-                            "**Gợi ý:** đổi Base URL và API key, sau đó tải model từ `/v1/models`."
-                        )
+                        gr.Markdown("**Gợi ý:** đổi Base URL và API key, sau đó tải model từ `/v1/models`.")
 
-            with gr.Tab("Base64 Ảnh"):
+            with gr.Tab("Base64 Ảnh", render_children=True):
                 gr.Markdown("Encode ảnh sang base64 hoặc decode base64 thành ảnh.")
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -202,95 +116,51 @@ def build_demo() -> gr.Blocks:
                     inputs=[encode_image_input],
                     outputs=[encoded_base64_output, encoded_data_url_output],
                 )
-                copy_base64_btn.click(
-                    fn=None,
-                    inputs=[encoded_base64_output],
-                    js="""
-                    (value) => {
-                        navigator.clipboard.writeText(value || "");
-                    }
-                    """,
-                )
-                copy_data_url_btn.click(
-                    fn=None,
-                    inputs=[encoded_data_url_output],
-                    js="""
-                    (value) => {
-                        navigator.clipboard.writeText(value || "");
-                    }
-                    """,
-                )
+                copy_base64_btn.click(fn=None, inputs=[encoded_base64_output], js=_COPY_JS)
+                copy_data_url_btn.click(fn=None, inputs=[encoded_data_url_output], js=_COPY_JS)
                 decode_btn.click(
                     decode_base64_to_image,
                     inputs=[decode_base64_input],
                     outputs=[decoded_image_output, decoded_file_output, decode_status],
                 )
 
+            with gr.Tab("MarkItDown", render_children=True):
+                gr.Markdown("Convert tài liệu (PDF, DOCX, XLSX, PPTX, HTML...) sang Markdown.")
+                with gr.Row():
+                    md_file_input = gr.File(label="Chọn file")
+                    md_convert_btn = gr.Button("Convert sang Markdown", variant="primary")
+                md_status = gr.Markdown(value="")
+                md_output = gr.Textbox(label="Markdown", lines=25)
+
+                md_convert_btn.click(
+                    convert_to_markdown,
+                    inputs=[md_file_input],
+                    outputs=[md_output, md_status],
+                )
+
         ui_state = gr.State([])
         api_state = gr.State([])
-        session_id_state = gr.State(lambda: uuid.uuid4().hex[:12])
+        session_id_state = gr.State(uuid.uuid4().hex[:12])
         custom_base_url_state = gr.State(env_any(["OPENAI_BASE_URL", "base_url"], "https://api.openai.com/v1"))
         custom_api_key_state = gr.State(env_any(["OPENAI_API_KEY", "api_key"], ""))
-        custom_model_state = gr.State(DEFAULT_MODEL)
+        custom_model_state = gr.State("")
 
         send_inputs = [
-            message,
-            ui_state,
-            api_state,
-            model_name,
-            base_url,
-            api_key,
-            temperature,
-            max_tokens,
-            system_prompt,
-            enable_thinking,
-            top_p,
+            message, ui_state, api_state, model_name, base_url, api_key,
+            temperature, max_tokens, system_prompt, enable_thinking, top_p,
             session_id_state,
         ]
         send_outputs = [chatbot, ui_state, api_state, message, usage_status]
 
         send_btn.click(chat, inputs=send_inputs, outputs=send_outputs)
         message.submit(chat, inputs=send_inputs, outputs=send_outputs)
+        demo.load(load_builtin_locked_model, inputs=[base_url, api_key], outputs=[model_name, model_status])
 
-        base_url.change(
-            remember_custom_inputs,
-            inputs=[
-                model_source,
-                base_url,
-                api_key,
-                model_name,
-                custom_base_url_state,
-                custom_api_key_state,
-                custom_model_state,
-            ],
-            outputs=[custom_base_url_state, custom_api_key_state, custom_model_state],
-        )
-        api_key.change(
-            remember_custom_inputs,
-            inputs=[
-                model_source,
-                base_url,
-                api_key,
-                model_name,
-                custom_base_url_state,
-                custom_api_key_state,
-                custom_model_state,
-            ],
-            outputs=[custom_base_url_state, custom_api_key_state, custom_model_state],
-        )
-        model_name.change(
-            remember_custom_inputs,
-            inputs=[
-                model_source,
-                base_url,
-                api_key,
-                model_name,
-                custom_base_url_state,
-                custom_api_key_state,
-                custom_model_state,
-            ],
-            outputs=[custom_base_url_state, custom_api_key_state, custom_model_state],
-        )
+        # Remember custom inputs from any field change
+        custom_inputs = [model_source, base_url, api_key, model_name, custom_base_url_state, custom_api_key_state, custom_model_state]
+        custom_outputs = [custom_base_url_state, custom_api_key_state, custom_model_state]
+        for component in (base_url, api_key, model_name):
+            component.change(remember_custom_inputs, inputs=custom_inputs, outputs=custom_outputs)
 
         model_source.change(
             switch_model_source,
@@ -300,23 +170,10 @@ def build_demo() -> gr.Blocks:
 
         refresh_models_btn.click(
             refresh_models_for_custom,
-            inputs=[
-                model_source,
-                base_url,
-                api_key,
-                model_name,
-                custom_base_url_state,
-                custom_api_key_state,
-                custom_model_state,
-            ],
+            inputs=[model_source, base_url, api_key, model_name, custom_base_url_state, custom_api_key_state, custom_model_state],
             outputs=[model_name, model_status, custom_base_url_state, custom_api_key_state, custom_model_state],
         )
 
-        demo.load(
-            switch_model_source,
-            inputs=[model_source, custom_base_url_state, custom_api_key_state, custom_model_state],
-            outputs=[base_url, api_key, model_name, model_status],
-        )
         clear_btn.click(clear_chat, outputs=[chatbot, ui_state, api_state, message, usage_status])
 
     return demo
