@@ -17,8 +17,40 @@ from .handlers import (
 from .utils import decode_base64_to_image, encode_image_to_base64
 
 _COPY_JS = """
-(value) => {
-    navigator.clipboard.writeText(value || "");
+async (value) => {
+    const text = value || "";
+    if (!text) {
+        return;
+    }
+
+    if (navigator.clipboard && window.isSecureContext) {
+        try {
+            await navigator.clipboard.writeText(text);
+            return;
+        } catch (error) {
+            console.warn("Clipboard API failed, falling back to textarea copy.", error);
+        }
+    }
+
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.left = "-9999px";
+    textarea.style.top = "0";
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    textarea.setSelectionRange(0, textarea.value.length);
+
+    try {
+        const copied = document.execCommand("copy");
+        if (!copied) {
+            window.prompt("Copy thủ công:", text);
+        }
+    } finally {
+        document.body.removeChild(textarea);
+    }
 }
 """
 
