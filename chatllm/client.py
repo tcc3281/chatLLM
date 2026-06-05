@@ -5,6 +5,7 @@ from typing import Any
 from openai import OpenAI
 
 from .config import env
+from .schemas import MediaUrl
 
 
 def make_client(base_url: str, api_key: str, timeout: float | None = None) -> OpenAI:
@@ -35,12 +36,7 @@ def list_models(base_url: str, api_key: str) -> list[str]:
     return models
 
 
-def build_user_content(
-    text: str,
-    image_paths: list[str],
-    media_urls: list[dict[str, str]],
-) -> list[dict[str, Any]]:
-    content: list[dict[str, Any]] = []
+def _append_remote_media(content: list[dict[str, Any]], media_urls: list[MediaUrl]) -> None:
     for media in media_urls:
         media_type = media["type"]
         content.append(
@@ -50,14 +46,38 @@ def build_user_content(
             }
         )
 
+
+def _append_uploaded_images(content: list[dict[str, Any]], image_paths: list[str]) -> None:
+    from .utils import file_to_data_url
+
     for image_path in image_paths:
-        from .utils import file_to_data_url
         content.append(
             {
                 "type": "image_url",
                 "image_url": {"url": file_to_data_url(image_path)},
             }
         )
+
+
+def _log_outgoing_content(text: str, image_paths: list[str], media_urls: list[MediaUrl]) -> None:
+    if text:
+        print(f"[chatLLM] Sending text content (length: {len(text)})")
+    if media_urls:
+        image_count = sum(1 for media in media_urls if media["type"] == "image_url")
+        video_count = sum(1 for media in media_urls if media["type"] == "video_url")
+        print(f"[chatLLM] Sending remote media (images: {image_count}, videos: {video_count})")
+    if image_paths:
+        print(f"[chatLLM] Sending {len(image_paths)} uploaded images")
+
+
+def build_user_content(
+    text: str,
+    image_paths: list[str],
+    media_urls: list[MediaUrl],
+) -> list[dict[str, Any]]:
+    content: list[dict[str, Any]] = []
+    _append_remote_media(content, media_urls)
+    _append_uploaded_images(content, image_paths)
     if text:
         content.append({"type": "text", "text": text})
     return content or [{"type": "text", "text": " "}]
@@ -66,20 +86,9 @@ def build_user_content(
 def api_message_content(
     text: str,
     image_paths: list[str],
-    media_urls: list[dict[str, str]],
+    media_urls: list[MediaUrl],
 ) -> str | list[dict[str, Any]]:
-    if text:
-        print(f"[chatLLM] Sending text content (length: {len(text)})")
-    if media_urls:
-        counts = {"image_url": 0, "video_url": 0}
-        for media in media_urls:
-            counts[media["type"]] += 1
-        print(
-            "[chatLLM] Sending remote media "
-            f"(images: {counts['image_url']}, videos: {counts['video_url']})"
-        )
-    if image_paths:
-        print(f"[chatLLM] Sending {len(image_paths)} uploaded images")
+    _log_outgoing_content(text, image_paths, media_urls)
 
     if image_paths or media_urls:
         return build_user_content(text, image_paths, media_urls)

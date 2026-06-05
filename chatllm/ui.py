@@ -22,6 +22,29 @@ _COPY_JS = """
 }
 """
 
+_CLEAN_MULTIMODAL_TEXT_JS = """
+(value) => {
+    const clean = (text) => {
+        return (text || "")
+            .replace(/\\s*\\[Image\\s*#\\d+\\]\\s*/gi, " ")
+            .replace(/(^|[\\s([])(?:file:\\/\\/)?\\/[^\\s<>'")]+\\.(?:png|jpe?g|gif|webp|bmp|tiff?)(?=$|[\\s.,;:!?)]|["'])/gi, "$1")
+            .replace(/[ \\t]{2,}/g, " ")
+            .replace(/\\n{3,}/g, "\\n\\n")
+            .trim();
+    };
+
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+        return {...value, text: clean(value.text)};
+    }
+
+    if (typeof value === "string") {
+        return clean(value);
+    }
+
+    return value;
+}
+"""
+
 
 def build_demo() -> gr.Blocks:
     with gr.Blocks(title="ChatLLM Tester") as demo:
@@ -154,6 +177,14 @@ def build_demo() -> gr.Blocks:
 
         send_btn.click(chat, inputs=send_inputs, outputs=send_outputs)
         message.submit(chat, inputs=send_inputs, outputs=send_outputs)
+        message.input(
+            fn=None,
+            inputs=[message],
+            outputs=[message],
+            js=_CLEAN_MULTIMODAL_TEXT_JS,
+            queue=False,
+            show_progress="hidden",
+        )
         demo.load(load_builtin_locked_model, inputs=[base_url, api_key], outputs=[model_name, model_status])
 
         # Remember custom inputs from any field change

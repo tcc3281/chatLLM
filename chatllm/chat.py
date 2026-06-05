@@ -10,6 +10,7 @@ from openai import Stream
 
 from .client import api_message_content, make_client, resolve_model
 from .config import DEFAULT_SYSTEM_PROMPT
+from .schemas import ChatSettings, MediaUrl, PreparedUserMessage, StreamState
 from .utils import (
     extract_media_urls,
     get_youtube_info,
@@ -17,6 +18,14 @@ from .utils import (
     normalize_message,
     save_chat_history,
 )
+
+
+def _clear_input() -> dict[str, Any]:
+    return {"text": "", "files": []}
+
+
+def _youtube_transcription_block(url: str, content: str) -> str:
+    return f"<youtube_transcription url=\"{url}\">\n{content}\n</youtube_transcription>"
 
 
 def _extract_youtube(text: str) -> str:
@@ -27,7 +36,10 @@ def _extract_youtube(text: str) -> str:
             print(f"[chatLLM] Extracting YouTube info from text: {yt_url}...")
             extracted = get_youtube_info(yt_url)
             if extracted:
-                text = text.replace(yt_url, f"{yt_url}\n\n<youtube_transcription url=\"{yt_url}\">\n{extracted}\n</youtube_transcription>")
+                text = text.replace(
+                    yt_url,
+                    f"{yt_url}\n\n{_youtube_transcription_block(yt_url, extracted)}",
+                )
                 print(f"[chatLLM] Successfully extracted YouTube info")
         except Exception as exc:
             print(f"[chatLLM] YouTube extraction error for {yt_url}: {exc}")
@@ -70,7 +82,7 @@ def build_display_content(
     text: str,
     image_paths: list[str],
     other_file_paths: list[str],
-    media_urls: list[dict[str, str]],
+    media_urls: list[MediaUrl],
 ) -> str | list[Any]:
     if not image_paths and not other_file_paths and not media_urls:
         return text or "[Tin nhắn trống]"
@@ -97,6 +109,140 @@ def build_display_content(
     return content
 
 
+def _prepare_user_message(message: Any) -> PreparedUserMessage:
+    text, file_paths = normalize_message(message)
+    text = _extract_youtube(text)
+    text, media_urls = extract_media_urls(text)
+    text, image_paths, other_file_paths = merge_text_with_text_files(text, file_paths)
+    return PreparedUserMessage(
+        text=text,
+        image_paths=image_paths,
+        other_file_paths=other_file_paths,
+        media_urls=media_urls,
+    )
+
+
+def _validate_user_message(user_message: PreparedUserMessage) -> None:
+    if not user_message.text and not user_message.image_paths and not user_message.media_urls:
+        raise gr.Error("Nhập nội dung, URL ảnh/video hoặc tải ảnh lên trước khi gửi.")
+
+    for image_path in user_message.image_paths:
+        if not Path(image_path).exists():
+            raise gr.Error(f"Không tìm thấy file ảnh: {image_path}")
+
+
+def _resolve_model_for_ui(model_name: str) -> str:
+    try:
+        return resolve_model(model_name)
+    except ValueError as exc:
+        raise gr.Error(str(exc)) from exc
+
+
+def _build_request_messages(
+    system_prompt: str,
+    api_history: list[dict[str, Any]],
+    user_content: str | list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        {"role": "system", "content": system_prompt.strip() or DEFAULT_SYSTEM_PROMPT},
+        *api_history,
+        {"role": "user", "content": user_content},
+    ]
+
+
+def _build_extra_body(enable_thinking: bool) -> dict[str, Any]:
+    if not enable_thinking:
+        return {}
+    return {"chat_template_kwargs": {"enable_thinking": True}}
+
+
+def _format_reasoning_display(
+    assistant_text: str,
+    reasoning_text: str,
+    *,
+    is_complete: bool,
+) -> str:
+    if not reasoning_text:
+        return assistant_text
+
+    if is_complete:
+        summary = "Thinking Process (Completed)"
+        open_attr = ""
+    else:
+        summary = "Thinking Process"
+        open_attr = " open"
+
+    return (
+        f"<details{open_attr}>\n"
+        f"<summary>{summary}</summary>\n\n"
+        f"{reasoning_text}\n"
+        f"</details>\n\n{assistant_text}"
+    )
+
+
+def _update_stream_state(state: StreamState, chunk: ChatCompletionChunk) -> bool:
+    if hasattr(chunk, "usage") and chunk.usage:
+        state.usage_info = chunk.usage
+        return False
+
+    if not chunk.choices:
+        return False
+
+    delta = chunk.choices[0].delta
+
+    reasoning_delta = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None)
+    if reasoning_delta:
+        state.reasoning_text += reasoning_delta
+
+    content_delta = delta.content or ""
+    if content_delta:
+        state.assistant_text, state.reasoning_text, state.in_manual_reasoning = _process_thinking_delta(
+            content_delta,
+            state.assistant_text,
+            state.reasoning_text,
+            state.in_manual_reasoning,
+        )
+    return True
+
+
+def _final_assistant_text(state: StreamState) -> str:
+    return state.assistant_text.strip() or (
+        state.reasoning_text.strip() and "(thinking completed, no content)"
+    ) or "(không có nội dung trả về)"
+
+
+def _usage_payload(usage_info: Any) -> dict[str, int] | None:
+    if not usage_info:
+        return None
+    return {
+        "prompt_tokens": usage_info.prompt_tokens,
+        "completion_tokens": usage_info.completion_tokens,
+        "total_tokens": usage_info.total_tokens,
+    }
+
+
+def _save_chat_turn(
+    session_id: str,
+    settings: ChatSettings,
+    usage_info: Any,
+    messages: list[dict[str, Any]],
+) -> None:
+    save_chat_history(
+        session_id=session_id,
+        config={
+            "model": settings.model,
+            "base_url": settings.base_url,
+            "temperature": settings.temperature,
+            "top_p": settings.top_p,
+            "max_tokens": settings.max_tokens,
+            "system_prompt": settings.system_prompt,
+            "enable_thinking": settings.enable_thinking,
+            "usage": _usage_payload(usage_info),
+        },
+        messages=messages,
+    )
+
+
 def chat(
     message: Any,
     ui_history: list[dict[str, Any]],
@@ -111,95 +257,73 @@ def chat(
     top_p: float = 0.9,
     session_id: str = "",
 ) -> Generator[tuple[list, list, list, dict, str], None, None]:
-    def _clear_input() -> dict[str, Any]:
-        return {"text": "", "files": []}
+    user_message = _prepare_user_message(message)
+    _validate_user_message(user_message)
 
-    text, file_paths = normalize_message(message)
-    text = _extract_youtube(text)
-    text, media_urls = extract_media_urls(text)
-    text, image_paths, other_file_paths = merge_text_with_text_files(text, file_paths)
-
-    if not text and not image_paths and not media_urls:
-        raise gr.Error("Nhập nội dung, URL ảnh/video hoặc tải ảnh lên trước khi gửi.")
-
-    for image_path in image_paths:
-        if not Path(image_path).exists():
-            raise gr.Error(f"Không tìm thấy file ảnh: {image_path}")
-
-    try:
-        model = resolve_model(model_name)
-    except ValueError as exc:
-        raise gr.Error(str(exc)) from exc
-    client = make_client(base_url, api_key)
-    display_content = build_display_content(text, image_paths, other_file_paths, media_urls)
+    settings = ChatSettings(
+        model=_resolve_model_for_ui(model_name),
+        base_url=base_url,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+        system_prompt=system_prompt,
+        enable_thinking=enable_thinking,
+    )
+    client = make_client(settings.base_url, api_key)
+    display_content = build_display_content(
+        user_message.text,
+        user_message.image_paths,
+        user_message.other_file_paths,
+        user_message.media_urls,
+    )
 
     ui_history = list(ui_history) + [
         {"role": "user", "content": display_content},
         {"role": "assistant", "content": ""},
     ]
 
-    user_content = api_message_content(text, image_paths, media_urls)
-    request_messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system_prompt.strip() or DEFAULT_SYSTEM_PROMPT},
-        *api_history,
-        {"role": "user", "content": user_content},
-    ]
-
-    extra_body: dict[str, Any] = {}
-    if enable_thinking:
-        extra_body["chat_template_kwargs"] = {"enable_thinking": True}
-
-    stream: Stream[ChatCompletionChunk] = client.chat.completions.create(
-        model=model,
-        messages=request_messages,
-        temperature=float(temperature),
-        top_p=float(top_p),
-        max_tokens=int(max_tokens),
-        stream=True,
-        stream_options={"include_usage": True},
-        extra_body=extra_body,
+    user_content = api_message_content(
+        user_message.text,
+        user_message.image_paths,
+        user_message.media_urls,
     )
 
-    assistant_text = ""
-    reasoning_text = ""
-    in_manual_reasoning = False
-    usage_info = None
+    stream: Stream[ChatCompletionChunk] = client.chat.completions.create(
+        model=settings.model,
+        messages=_build_request_messages(settings.system_prompt, api_history, user_content),
+        temperature=float(settings.temperature),
+        top_p=float(settings.top_p),
+        max_tokens=int(settings.max_tokens),
+        stream=True,
+        stream_options={"include_usage": True},
+        extra_body=_build_extra_body(settings.enable_thinking),
+    )
+
+    stream_state = StreamState()
 
     for chunk in stream:
-        if hasattr(chunk, "usage") and chunk.usage:
-            usage_info = chunk.usage
+        if not _update_stream_state(stream_state, chunk):
             continue
-
-        if not chunk.choices:
-            continue
-
-        delta = chunk.choices[0].delta
-
-        reasoning_delta = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None)
-        if reasoning_delta:
-            reasoning_text += reasoning_delta
-
-        content_delta = delta.content or ""
-        if content_delta:
-            assistant_text, reasoning_text, in_manual_reasoning = _process_thinking_delta(
-                content_delta, assistant_text, reasoning_text, in_manual_reasoning
-            )
-
-        display_text = assistant_text
-        if reasoning_text:
-            display_text = f"<details open>\n<summary>Thinking Process</summary>\n\n{reasoning_text}\n</details>\n\n{assistant_text}"
-
+        display_text = _format_reasoning_display(
+            stream_state.assistant_text,
+            stream_state.reasoning_text,
+            is_complete=False,
+        )
         ui_history[-1]["content"] = display_text or "..."
+        yield (
+            ui_history,
+            ui_history,
+            api_history,
+            _clear_input(),
+            _build_usage_display(stream_state.usage_info),
+        )
 
-        yield ui_history, ui_history, api_history, _clear_input(), _build_usage_display(usage_info)
-
-    assistant_text = assistant_text.strip() or (
-        reasoning_text.strip() and "(thinking completed, no content)"
-    ) or "(không có nội dung trả về)"
-
-    final_display = assistant_text
-    if reasoning_text:
-        final_display = f"<details>\n<summary>Thinking Process (Completed)</summary>\n\n{reasoning_text}\n</details>\n\n{assistant_text}"
+    assistant_text = _final_assistant_text(stream_state)
+    final_display = _format_reasoning_display(
+        assistant_text,
+        stream_state.reasoning_text,
+        is_complete=True,
+    )
 
     ui_history[-1]["content"] = final_display
     api_history = list(api_history) + [
@@ -207,25 +331,17 @@ def chat(
         {"role": "assistant", "content": assistant_text},
     ]
 
-    save_chat_history(
+    _save_chat_turn(
         session_id=session_id,
-        config={
-            "model": model,
-            "base_url": base_url,
-            "temperature": temperature,
-            "top_p": top_p,
-            "max_tokens": max_tokens,
-            "system_prompt": system_prompt,
-            "enable_thinking": enable_thinking,
-            "usage": {
-                "prompt_tokens": usage_info.prompt_tokens if usage_info else 0,
-                "completion_tokens": usage_info.completion_tokens if usage_info else 0,
-                "total_tokens": usage_info.total_tokens if usage_info else 0,
-            }
-            if usage_info
-            else None,
-        },
+        settings=settings,
+        usage_info=stream_state.usage_info,
         messages=api_history[-2:],
     )
 
-    yield ui_history, ui_history, api_history, _clear_input(), _build_usage_display(usage_info)
+    yield (
+        ui_history,
+        ui_history,
+        api_history,
+        _clear_input(),
+        _build_usage_display(stream_state.usage_info),
+    )

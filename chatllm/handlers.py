@@ -6,8 +6,28 @@ from typing import Any
 import gradio as gr
 
 from .client import list_models
-from .config import DEFAULT_SYSTEM_PROMPT, env_any
+from .config import env_any
 from .utils import get_markitdown, normalize_files
+
+_BASE_URL_ENV_NAMES = ["OPENAI_BASE_URL", "base_url"]
+_API_KEY_ENV_NAMES = ["OPENAI_API_KEY", "api_key"]
+_DEFAULT_BASE_URL = "https://api.openai.com/v1"
+
+
+def _default_base_url() -> str:
+    return env_any(_BASE_URL_ENV_NAMES, _DEFAULT_BASE_URL)
+
+
+def _default_api_key() -> str:
+    return env_any(_API_KEY_ENV_NAMES, "")
+
+
+def _dropdown_with_optional_model(model: str, *, interactive: bool | None = None) -> gr.Dropdown:
+    choices = [model] if model else []
+    kwargs: dict[str, Any] = {"choices": choices, "value": model or None}
+    if interactive is not None:
+        kwargs["interactive"] = interactive
+    return gr.update(**kwargs)
 
 
 def clear_chat():
@@ -27,7 +47,7 @@ def load_builtin_locked_model(base_url: str, api_key: str) -> tuple[gr.Dropdown,
         )
     except Exception as exc:
         return (
-            gr.update(choices=[], value=None, interactive=False),
+            _dropdown_with_optional_model("", interactive=False),
             f"Model có sẵn: không tải được /v1/models ({exc}). Kiểm tra Base URL/API key rồi tải lại.",
         )
 
@@ -39,8 +59,7 @@ def load_models(base_url: str, api_key: str, current_model: str | None = None) -
         return gr.update(choices=models, value=selected), f"Đã tải {len(models)} model."
     except Exception as exc:
         fallback = (current_model or "").strip()
-        choices = [fallback] if fallback else []
-        return gr.update(choices=choices, value=fallback or None), f"Không tải được model: {exc}"
+        return _dropdown_with_optional_model(fallback), f"Không tải được model: {exc}"
 
 
 def remember_custom_inputs(
@@ -64,18 +83,18 @@ def switch_model_source(
     custom_model: str,
 ):
     if model_source == "Custom":
-        base = (custom_base_url or env_any(["OPENAI_BASE_URL", "base_url"], "https://api.openai.com/v1")).strip()
-        key = (custom_api_key or env_any(["OPENAI_API_KEY", "api_key"], "")).strip()
+        base = (custom_base_url or _default_base_url()).strip()
+        key = (custom_api_key or _default_api_key()).strip()
         model = (custom_model or "").strip()
         return (
             gr.update(value=base, interactive=True),
             gr.update(value=key, interactive=True),
-            gr.update(choices=[model] if model else [], value=model or None, interactive=True),
+            _dropdown_with_optional_model(model, interactive=True),
             "Đã chuyển sang Custom. Giữ thông tin bạn đã nhập.",
         )
 
-    builtin_base = env_any(["OPENAI_BASE_URL", "base_url"], "https://api.openai.com/v1")
-    builtin_key = env_any(["OPENAI_API_KEY", "api_key"], "")
+    builtin_base = _default_base_url()
+    builtin_key = _default_api_key()
     model_update, status = load_builtin_locked_model(builtin_base, builtin_key)
     return (
         gr.update(value=builtin_base, interactive=False),
@@ -118,7 +137,7 @@ def refresh_models_for_custom(
     except Exception as exc:
         fallback = (current_model or custom_model or "").strip()
         return (
-            gr.update(choices=[fallback] if fallback else [], value=fallback or None, interactive=True),
+            _dropdown_with_optional_model(fallback, interactive=True),
             f"Không tải được model: {exc}",
             base_url,
             api_key,
