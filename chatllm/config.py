@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-DEFAULT_MODEL = "gpt-4o-mini"
 DEFAULT_SYSTEM_PROMPT = (
     "Bạn là trợ lý test model. Trả lời ngắn gọn, chính xác, hỗ trợ ảnh khi cần. "
     "Khi người dùng upload file, nội dung file sẽ được convert sang markdown và bọc trong tag <file_attachment>."

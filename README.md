@@ -4,6 +4,7 @@ Giao diện chat bằng Gradio để test model OpenAI-compatible, hỗ trợ:
 
 - Chat nhiều lượt
 - Upload hoặc paste nhiều ảnh
+- Dán URL ảnh/video trực tiếp để gửi dưới dạng `image_url`/`video_url`
 - Lấy danh sách model từ `/v1/models` theo `base_url`
 - Chỉnh temperature, max tokens, system prompt
 - Ẩn mục `Use via API` trên giao diện
@@ -60,4 +61,3 @@ Mỗi dòng trong file `.jsonl` chứa:
 - `PORT`: cổng, mặc định `7860`
 - `SHARE`: đặt `1` để bật Gradio share link
 - `CHAT_HISTORY_DIR`: đường dẫn lưu lịch sử chat, mặc định `./data/chat_history`
-
